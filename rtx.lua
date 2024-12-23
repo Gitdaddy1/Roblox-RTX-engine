@@ -1,194 +1,149 @@
--- Services so it can take control of the lighting engine 
+
+-- Services
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local Lighting = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
 
--- Disable built-in lighting effects modify this to lighting brightness 0 but it will be very dark unless you crank up all the ray numbers lol
-Lighting.Brightness = 0.2
+-- Disable all built-in lighting effects
+Lighting.Brightness = 0
 Lighting.Ambient = Color3.new(0, 0, 0)
 Lighting.OutdoorAmbient = Color3.new(0, 0, 0)
 Lighting.GlobalShadows = false
 Lighting.EnvironmentDiffuseScale = 0
 Lighting.EnvironmentSpecularScale = 0
 
+-- Remove skybox and atmosphere effects
+for _, child in pairs(Lighting:GetChildren()) do
+	if child:IsA("Sky") or child:IsA("Atmosphere") or child:IsA("PostEffect") then
+		child:Destroy()
+	end
+end
 
+-- Disable all existing lights
+for _, descendant in pairs(Workspace:GetDescendants()) do
+	if descendant:IsA("PointLight") or descendant:IsA("SpotLight") or descendant:IsA("SurfaceLight") then
+		descendant.Enabled = false
+	end
+end
 
+-- Variables
 local localPlayer = Players.LocalPlayer
 local camera = Workspace.CurrentCamera
 
 -- Wait for the player's character to load
 local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
 
--- settings
-local sunDirection = Vector3.new(1, -1, 1).Unit -- Adjusted sun direction
-local sunColor = Color3.fromRGB(255, 255, 224) -- Soft sunlight color
-local sunIntensity = 100 -- Sun intensity
+-- Settings
 local skyColor = Color3.fromRGB(135, 206, 235) -- Sky blue color
-local skyIntensity = 0.5 -- Sky intensity
+local skyIntensity = 1 -- Adjust as needed
+local maxDistance = 1000 -- Maximum distance for rays to ensure they reach the sky
+local gammaCorrection = 2.2 -- For gamma correction
 
-local maxDistance = 50000 -- Maximum distance for rays
-local gammaCorrection = 10 -- For gamma correction
+-- Level of Detail (LOD) Settings
+local maxRays = 100 -- Maximum number of rays per point for high-quality lighting
+local minRays = 20 -- Minimum number of rays per point for distant objects
+local lodStartDistance = 50 -- Distance from the camera where LOD starts to reduce rays
+local lodEndDistance = 500 -- Distance from the camera where rays reach minRays
 
--- LOD Settings
-local maxRays = 100000 -- Maximum number of rays per point
-local minRays = 10000 -- Minimum number of rays per point
-local lodDistance = 200 -- Distance at which LOD reduces rays
-
-
-local function getSurfaceNormal(part, position)
-	if part:IsA("MeshPart") or part:IsA("UnionOperation") then
-		-- Approximate normal for MeshParts and Unions
-		local normal = (position - part.Position).Unit
-		return normal
+-- Function to calculate number of rays based on distance (LOD)
+local function calculateNumRays(distance)
+	if distance <= lodStartDistance then
+		return maxRays
+	elseif distance >= lodEndDistance then
+		return minRays
 	else
-		
-		local relativePosition = part.CFrame:PointToObjectSpace(position)
-		local halfSize = part.Size / 2
-
-		local normals = {
-			Vector3.new(1, 0, 0),
-			Vector3.new(-1, 0, 0),
-			Vector3.new(0, 1, 0),
-			Vector3.new(0, -1, 0),
-			Vector3.new(0, 0, 1),
-			Vector3.new(0, 0, -1),
-		}
-
-		local distances = {
-			math.abs(halfSize.X - relativePosition.X),
-			math.abs(-halfSize.X - relativePosition.X),
-			math.abs(halfSize.Y - relativePosition.Y),
-			math.abs(-halfSize.Y - relativePosition.Y),
-			math.abs(halfSize.Z - relativePosition.Z),
-			math.abs(-halfSize.Z - relativePosition.Z),
-		}
-
-		local minDistance = math.huge
-		local normal = Vector3.new(0, 1, 0)
-
-		for i = 1, 6 do
-			if distances[i] < minDistance then
-				minDistance = distances[i]
-				normal = normals[i]
-			end
-		end
-
-		return part.CFrame:VectorToWorldSpace(normal)
+		local t = (distance - lodStartDistance) / (lodEndDistance - lodStartDistance)
+		return math.floor(maxRays * (1 - t) + minRays * t)
 	end
 end
 
+-- Function to get the surface normal at the hit point
+local function getSurfaceNormal(part, position)
+	-- For simplicity, use the part's normal vector
+	local normal = (position - part.Position).Unit
+	return normal
+end
 
-local function computeLightingForPoint(part, position)
-	local accumulatedColor = Color3.new(0, 0, 0)
+-- Function to compute lighting for a single part
+local function computeLightingForPart(part)
+	local position = part.Position
 	local surfaceNormal = getSurfaceNormal(part, position)
+	local offsetPosition = position + surfaceNormal * 0.01 -- Small offset to prevent self-intersection
 
-	
-	local offsetPosition = position + surfaceNormal * 0.01
-
-	
+	-- Calculate distance from camera
 	local distanceFromCamera = (camera.CFrame.Position - position).Magnitude
-	local numRays = maxRays
 
-	if distanceFromCamera > lodDistance then
-		numRays = math.max(minRays, math.floor(maxRays * (lodDistance / distanceFromCamera)))
-	end
+	-- Determine number of rays based on LOD
+	local numRays = calculateNumRays(distanceFromCamera)
 
-	-- Accumulate light from sky
-	local skySamples = 10000000
-	local skyLight = Color3.new(0, 0, 0)
+	local accumulatedColor = Color3.new(0, 0, 0)
+	local validSamples = 0
 
 	for i = 1, numRays do
-		
-		local u = math.random()
-		local v = math.random()
-		local theta = math.acos(math.sqrt(1 - u))
-		local phi = 2 * math.pi * v
+		-- Generate random direction over the hemisphere oriented by the surface normal
+		local randomVector = Vector3.new(
+			math.random(-1000, 1000) / 1000,
+			math.random(-1000, 1000) / 1000,
+			math.random(-1000, 1000) / 1000
+		).Unit
 
-		local x = math.sin(theta) * math.cos(phi)
-		local y = math.cos(theta)
-		local z = math.sin(theta) * math.sin(phi)
+		if randomVector:Dot(surfaceNormal) > 0 then
+			-- Only consider directions in the hemisphere above the surface
+			local rayDirection = randomVector
 
-		local randomDirection = Vector3.new(x, y, z)
-		randomDirection = randomDirection.Unit
+			-- Raycast to check for occlusion
+			local rayParams = RaycastParams.new()
+			rayParams.FilterDescendantsInstances = {part}
+			rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+			rayParams.IgnoreWater = true
 
-		
-		local up = Vector3.new(0, 1, 0)
-		local rotation = CFrame.fromAxisAngle(up:Cross(surfaceNormal), math.acos(up:Dot(surfaceNormal)))
-		randomDirection = rotation:VectorToWorldSpace(randomDirection)
+			local result = Workspace:Raycast(offsetPosition, rayDirection * maxDistance, rayParams)
 
-		
-		local rayParams = RaycastParams.new()
-		rayParams.FilterDescendantsInstances = {part, character}
-		rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-		rayParams.IgnoreWater = true
-
-		local result = Workspace:Raycast(offsetPosition, randomDirection * maxDistance, rayParams)
-
-		if not result then
-			-- Reaches the sky
-			skyLight += skyColor
-			skySamples = skySamples + 1
+			if not result then
+				-- Ray reaches the sky
+				accumulatedColor += skyColor
+				validSamples = validSamples + 1
+			end
 		end
 	end
 
-	if skySamples > 0 then
-		skyLight = (skyLight / skySamples) * skyIntensity
-		accumulatedColor += skyLight
+	if validSamples > 0 then
+		accumulatedColor = (accumulatedColor / validSamples) * skyIntensity
+	else
+		accumulatedColor = Color3.new(0, 0, 0)
 	end
 
-	
-	local normalDotLight = math.max(0, surfaceNormal:Dot(-sunDirection))
-
-	
-	local rayParams = RaycastParams.new()
-	rayParams.FilterDescendantsInstances = {part, character}
-	rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-	rayParams.IgnoreWater = true
-
-	local sunOccluded = Workspace:Raycast(offsetPosition, -sunDirection * maxDistance, rayParams)
-
-	local shadowFactor = 1
-
-	if sunOccluded then
-		shadowFactor = 0 -- In shadow
-	end
-
-	
+	-- Apply material properties
 	local materialReflectance = part.Reflectance
 	local materialColor = part.Color
 
-	
-	local sunIntensityFactor = normalDotLight * sunIntensity * (1 - materialReflectance) * shadowFactor
-	local sunLight = sunColor * sunIntensityFactor
-
-	
-	sunLight = Color3.new(
-		sunLight.R * materialColor.R,
-		sunLight.G * materialColor.G,
-		sunLight.B * materialColor.B
+	-- Modulate with the material color and apply reflectance
+	accumulatedColor = Color3.new(
+		accumulatedColor.R * materialColor.R * (1 - materialReflectance),
+		accumulatedColor.G * materialColor.G * (1 - materialReflectance),
+		accumulatedColor.B * materialColor.B * (1 - materialReflectance)
 	)
 
-	accumulatedColor += sunLight
-
-	
+	-- Apply gamma correction
 	accumulatedColor = Color3.new(
 		accumulatedColor.R ^ (1 / gammaCorrection),
 		accumulatedColor.G ^ (1 / gammaCorrection),
 		accumulatedColor.B ^ (1 / gammaCorrection)
 	)
 
-	
+	-- Clamp color values to [0, 1]
 	accumulatedColor = Color3.new(
 		math.clamp(accumulatedColor.R, 0, 1),
 		math.clamp(accumulatedColor.G, 0, 1),
 		math.clamp(accumulatedColor.B, 0, 1)
 	)
 
-	return accumulatedColor
+	-- Apply the calculated color to the part
+	part.Color = accumulatedColor
 end
 
-
+-- Main function to compute lighting for all parts
 local parts = {}
 
 -- Gather all relevant parts once
@@ -197,7 +152,7 @@ local function gatherParts()
 
 	for _, obj in pairs(Workspace:GetDescendants()) do
 		if obj:IsA("BasePart") and obj.Transparency < 1 then
-			-- Set material to SmoothPlastic for consistency (optional)
+			-- Optional: Set material to SmoothPlastic for consistency
 			obj.Material = Enum.Material.SmoothPlastic
 			table.insert(parts, obj)
 			-- Ensure parts do not cast default shadows
@@ -206,27 +161,22 @@ local function gatherParts()
 	end
 end
 
-
+-- Gather parts initially
 gatherParts()
 
-
+-- Function to update lighting
 local function updateLighting()
 	for _, part in ipairs(parts) do
-		-- Compute lighting for the part's position
-		local partPosition = part.Position
-		local color = computeLightingForPoint(part, partPosition)
-		if color then
-			part.Color = color
-		end
+		computeLightingForPart(part)
 	end
 end
 
-
+-- Update lighting every frame
 RunService.RenderStepped:Connect(function()
 	updateLighting()
 end)
 
-
+-- Listen for new parts being added to the workspace
 Workspace.DescendantAdded:Connect(function(descendant)
 	if descendant:IsA("BasePart") and descendant.Transparency < 1 then
 		descendant.Material = Enum.Material.SmoothPlastic -- Optional
@@ -235,7 +185,7 @@ Workspace.DescendantAdded:Connect(function(descendant)
 	end
 end)
 
-
+-- Listen for parts being removed from the workspace
 Workspace.DescendantRemoving:Connect(function(descendant)
 	if descendant:IsA("BasePart") then
 		for i, part in ipairs(parts) do
@@ -248,6 +198,7 @@ Workspace.DescendantRemoving:Connect(function(descendant)
 end)
 
 -- Include player's character in the raycasting
+-- Add character parts to the parts list
 local function addCharacterParts(character)
 	for _, part in pairs(character:GetDescendants()) do
 		if part:IsA("BasePart") and part.Transparency < 1 then
@@ -257,7 +208,7 @@ local function addCharacterParts(character)
 	end
 end
 
-
+-- Initial addition of character parts
 addCharacterParts(character)
 
 -- Update character parts when character respawns
